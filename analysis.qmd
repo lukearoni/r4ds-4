@@ -2,5 +2,163 @@
 title: "NBA and FIFA"
 format: html
 author: Luke Li
+execute: 
+  echo: false
 ---
 
+```{r}
+#| message: false
+library(tidyverse)
+library(arrow)
+library(plotly)
+library(viridis)
+library(scales)
+```
+
+```{r}
+#| cache: true
+nba_clean <- open_dataset("data/game.parquet") |>
+  collect() |>
+  left_join(
+    open_dataset("data/line_score.parquet") |> collect(),
+    by = "game_id",
+    relationship = "many-to-many"
+  ) |>
+  mutate(
+    game_date = ymd_hms(game_date),
+    game_date_est = ymd_hms(game_date_est)
+  ) |>
+  drop_na(pts_home.x)|>
+    mutate(
+    game_date = as_datetime(game_date),
+    game_year = year(game_date),
+    season_label = paste0(season_id %/% 10000, "-", str_sub(season_id + 1, 3, 4))
+  ) %>%
+  filter(!is.na(game_date), game_year >= 1946) %>%
+    mutate(
+    wl_home = factor(wl_home, levels = c("W", "L")),
+    game_era = case_when(
+      game_year <= 1979 ~ "Pre-Three Point",
+      game_year <= 1999 ~ "Modern Era", 
+      game_year <= 2019 ~ "Analytics Era",
+      TRUE ~ "Current Era"
+    ),
+    game_era = factor(game_era, levels = c("Pre-Three Point", "Modern Era", "Analytics Era", "Current Era"))
+  ) |>  
+    mutate(
+        across(contains("pct"), ~replace_na(.x, 0)),
+        across(c(pts_home.x, pts_away.x), ~replace_na(.x, 0)),
+        total_points = pts_home.x + pts_away.x
+     ) %>%
+     filter(total_points > 0, !is.na(pts_home.x), !is.na(pts_away.x))|>
+  group_by(game_year, game_era, season_label) %>%
+  summarise(
+    avg_points = mean(total_points, na.rm = TRUE),
+    games_count = n(),
+    home_win_pct = mean(wl_home == "W", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(game_year)
+```
+
+```{r}
+nba_clean |>
+  ggplot(aes(
+    x = game_year,
+    y = avg_points,
+    colour = game_era,
+    size = games_count
+  )) +
+  geom_line() +
+  geom_point() +
+  scale_color_viridis_d(option = "plasma", end = 0.9) +
+  labs(
+    title = "Average Points per Game Over Time",
+    subtitle = "Trends in scoring across NBA eras (Pre-Three Point, Modern, Analytics, Current)",
+    x = "Game Year",
+    y = "Average Points per Game",
+    size = "Number of Games",
+    colour = "Game Era",
+    caption = "Data: nba_clean (joined from data/game.parquet & data/line_score.parquet)"
+  )
+```
+
+```{r}
+#| cache: true
+final_fifa <- "data/fifa.parquet" |>
+  open_dataset() |>
+  collect() |>
+  mutate(
+    height_cm = as.numeric(str_extract(Height, "\\d+")),
+    weight_kg = as.numeric(str_extract(Weight, "\\d+"))
+  ) |>
+  mutate(across(where(is.character), ~str_replace_all(.x, "\\n", ""))) |>
+  mutate(across(where(is.character), ~str_trim(.x))) |>
+  mutate(
+    joined_date = mdy(Joined),
+    years_at_club = as.numeric(today() - joined_date) / 365.25,
+    long_tenure = years_at_club > 10
+  ) |>
+  drop_na(joined_date) |>
+  mutate(
+    value_numeric = case_when(
+      is.na(Value) | Value == "" | Value == "0" ~ 0,
+      str_detect(Value, "M") ~ as.numeric(str_remove_all(Value, "[€M★-]")) * 1000000,
+      str_detect(Value, "K") ~ as.numeric(str_remove_all(Value, "[€K★-]")) * 1000,
+      str_detect(Value, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Value, "€")),
+      TRUE ~ 0
+    ),
+    wage_numeric = case_when(
+      is.na(Wage) | Wage == "" | Wage == "0" ~ 0,
+      str_detect(Wage, "K") ~ as.numeric(str_remove_all(Wage, "[€K★-]")) * 1000,
+      str_detect(Wage, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Wage, "€")),
+      TRUE ~ 0
+    ),
+    release_clause_numeric = case_when(
+      is.na(Release.Clause) | Release.Clause == "" | Release.Clause == "0" ~ 0,
+      str_detect(Release.Clause, "M") ~ as.numeric(str_remove_all(Release.Clause, "[€M★-]")) * 1000000,
+      str_detect(Release.Clause, "K") ~ as.numeric(str_remove_all(Release.Clause, "[€K★-]")) * 1000,
+      str_detect(Release.Clause, "^€?[0-9.]+$") ~ as.numeric(str_remove_all(Release.Clause, "€")),
+      TRUE ~ 0
+    )
+  )
+```
+
+```{r}
+final_fifa |>
+  slice_head(n = 3)
+
+# Bubble chart: Age vs Overall (X.OVA) with market value as size and color
+final_fifa |>
+  filter(value_numeric > 0, X.OVA > 60) |>
+  ggplot(aes(
+    x = Age,
+    y = X.OVA,
+    size = value_numeric,
+    color = value_numeric
+  )) +
+  geom_point(alpha = 0.7) +
+  geom_line(aes(group = 1), alpha = 0.3) +  # optional line connecting points
+  scale_size_continuous(
+    range = c(2, 15),
+    labels = scales::label_currency(prefix = "€", scale = 1e-6, suffix = "M")
+  ) +
+  viridis::scale_color_viridis(option = "plasma", trans = "sqrt") +
+  labs(
+    title = "FIFA Player Age vs Overall Rating",
+    subtitle = "Bubble size and color represent player market value",
+    x = "Age",
+    y = "Overall Rating (X.OVA)",
+    color = "Market Value (€)",
+    size = "Market Value (€)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "right",
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_line(color = "gray90"),
+    plot.background = element_rect(fill = "white")
+  )
+```
